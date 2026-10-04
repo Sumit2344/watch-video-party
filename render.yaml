@@ -21,10 +21,7 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_URL
-        fromService:
-          type: web
-          name: together-watch-party-api
-          property: host
+        value: https://together-watch-party-api.onrender.com
     routes:
       - type: rewrite
         source: /*
