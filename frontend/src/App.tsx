@@ -2,15 +2,17 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "re
 import { io, Socket } from "socket.io-client";
 
 type Role = "host" | "moderator" | "participant";
-type Action = "play" | "pause" | "seek" | "change_video";
+type Action = "play" | "pause" | "seek" | "change_video" | "change_playlist" | "navigate_playlist";
+type ActionPayload = { time?: number; videoId?: string; playlistId?: string; playlistIndex?: number };
 type Participant = { userId: string; username: string; role: Role; joinedAt: number };
-type Request = { id: string; userId: string; username: string; action: Action; payload: { time?: number; videoId?: string } };
-type RoomState = { id: string; videoId: string; isPlaying: boolean; currentTime: number; updatedAt: number; participants: Participant[] };
+type Request = { id: string; userId: string; username: string; action: Action; payload: ActionPayload };
+type RoomState = { id: string; videoId: string; playlistId: string; playlistIndex: number; isPlaying: boolean; currentTime: number; updatedAt: number; participants: Participant[] };
 type ChatMessage = { id: string; userId: string; username: string; kind: "text" | "gif"; message?: string; gifData?: string; createdAt: number };
 type LiveReaction = { id: string; userId: string; username: string; emoji: string; createdAt: number };
 type JoinedPayload = { state: RoomState; requests: Request[] };
 const LIVE_REACTIONS = ["❤️", "👍", "😂", "🔥"] as const;
 const MAX_GIF_SIZE = 512 * 1024;
+const MAX_PLAYLIST_ITEMS = 500;
 
 declare global {
   interface Window {
@@ -20,7 +22,7 @@ declare global {
         playerVars?: Record<string, number | string>;
         events?: {
           onReady?: (event: { target: YouTubePlayer }) => void;
-          onStateChange?: (event: { data: number }) => void;
+          onStateChange?: (event: { data: number; target: YouTubePlayer }) => void;
           onError?: (event: { data: number }) => void;
         };
       }) => YouTubePlayer;
@@ -35,6 +37,10 @@ interface YouTubePlayer {
   seekTo(seconds: number, allowSeekAhead: boolean): void;
   loadVideoById(videoId: string, startSeconds?: number): void;
   cueVideoById(videoId: string, startSeconds?: number): void;
+  loadPlaylist(options: { list: string; listType: "playlist"; index: number; startSeconds: number }): void;
+  cuePlaylist(options: { list: string; listType: "playlist"; index: number; startSeconds: number }): void;
+  getPlaylist(): string[];
+  getPlaylistIndex(): number;
   getCurrentTime(): number;
   getDuration(): number;
   getPlayerState(): number;
@@ -79,6 +85,18 @@ function extractVideoId(value: string): string | null {
   }
 }
 
+function extractPlaylistId(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    const hostname = url.hostname.toLowerCase();
+    if (hostname !== "youtu.be" && hostname !== "youtube.com" && !hostname.endsWith(".youtube.com")) return null;
+    const id = url.searchParams.get("list");
+    return id && /^[\w-]{10,128}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const minutes = Math.floor(seconds / 60);
@@ -99,6 +117,7 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [inviteCopied, setInviteCopied] = useState(false);
   const [duration, setDuration] = useState(0);
+  const [playlistSize, setPlaylistSize] = useState(0);
   const [liveTime, setLiveTime] = useState(0);
   const [needsPlaybackTap, setNeedsPlaybackTap] = useState(false);
   const playerHost = useRef<HTMLDivElement>(null);
@@ -170,22 +189,27 @@ function App() {
   }, [liveReactions]);
 
   useEffect(() => {
-    if (!room?.videoId) return;
+    if (!room?.videoId && !room?.playlistId) return;
     let interval: number | undefined;
     let playerReady = false;
     let cancelled = false;
     const initPlayer = () => {
       if (cancelled || !playerHost.current || !window.YT?.Player || player.current) return;
       const initialRoom = roomRef.current;
-      if (!initialRoom?.videoId) return;
+      if (!initialRoom?.videoId && !initialRoom?.playlistId) return;
       player.current = new window.YT.Player(playerHost.current, {
-        videoId: initialRoom.videoId,
+        ...(initialRoom.videoId ? { videoId: initialRoom.videoId } : {}),
         playerVars: { autoplay: 0, controls: 0, rel: 0, modestbranding: 1, playsinline: 1 },
         events: {
           onReady: ({ target }) => {
             playerReady = true;
             const currentRoom = roomRef.current;
-            if (currentRoom?.videoId) {
+            if (currentRoom?.playlistId) {
+              const options = { list: currentRoom.playlistId, listType: "playlist" as const, index: currentRoom.playlistIndex, startSeconds: currentRoom.currentTime };
+              if (currentRoom.isPlaying) target.loadPlaylist(options);
+              else target.cuePlaylist(options);
+              lastApplied.current = `playlist:${currentRoom.playlistId}:${currentRoom.playlistIndex}:${currentRoom.isPlaying}:${currentRoom.currentTime}`;
+            } else if (currentRoom?.videoId) {
               if (currentRoom.isPlaying) target.loadVideoById(currentRoom.videoId, currentRoom.currentTime);
               else target.cueVideoById(currentRoom.videoId, currentRoom.currentTime);
               lastApplied.current = `${currentRoom.videoId}:${currentRoom.isPlaying}:${currentRoom.currentTime}`;
@@ -193,14 +217,22 @@ function App() {
               lastApplied.current = "";
             }
             setDuration(target.getDuration());
+            setPlaylistSize(target.getPlaylist().length);
           },
-          onStateChange: ({ data }) => {
+          onStateChange: ({ data, target }) => {
+            const currentRoom = roomRef.current;
             if (data === 1) {
               setNeedsPlaybackTap(false);
               setLiveTime(player.current?.getCurrentTime() ?? 0);
-            } else if (data === 2 && roomRef.current?.isPlaying) {
+              const activeParticipant = currentRoom?.participants.find((participant) => participant.userId === meId);
+              const index = target.getPlaylistIndex();
+              if (currentRoom?.playlistId && index >= 0 && index !== currentRoom.playlistIndex && activeParticipant && (activeParticipant.role === "host" || activeParticipant.role === "moderator")) {
+                socket.emit("playback_action", { action: "navigate_playlist", payload: { playlistIndex: index } });
+              }
+            } else if (data === 2 && currentRoom?.isPlaying) {
               setNeedsPlaybackTap(true);
             }
+            setPlaylistSize(target.getPlaylist().length);
           },
           onError: ({ data }) => {
             const message = data === 101 || data === 150
@@ -220,6 +252,8 @@ function App() {
           if (Number.isFinite(time)) setLiveTime(time);
           const total = player.current.getDuration();
           if (Number.isFinite(total) && total > 0) setDuration(total);
+          const items = player.current.getPlaylist();
+          if (items.length > 0) setPlaylistSize(items.length);
         }
       }, 1000);
     };
@@ -243,7 +277,7 @@ function App() {
       player.current?.destroy();
       player.current = null;
     };
-  }, [Boolean(room?.videoId)]);
+  }, [Boolean(room?.videoId || room?.playlistId), meId, socket]);
 
   useEffect(() => {
     if (!room || !canControl) return;
@@ -255,9 +289,28 @@ function App() {
   }, [Boolean(room), canControl, socket]);
 
   useEffect(() => {
-    if (!room?.videoId || !player.current) return;
-    const signature = `${room.videoId}:${room.isPlaying}:${room.currentTime}`;
+    if ((!room?.videoId && !room?.playlistId) || !player.current) return;
+    const signature = room.playlistId
+      ? `playlist:${room.playlistId}:${room.playlistIndex}:${room.isPlaying}:${room.currentTime}`
+      : `${room.videoId}:${room.isPlaying}:${room.currentTime}`;
     if (lastApplied.current === signature) return;
+    if (room.playlistId) {
+      const selection = `playlist:${room.playlistId}:${room.playlistIndex}:`;
+      if (!lastApplied.current.startsWith(selection)) {
+        const options = { list: room.playlistId, listType: "playlist" as const, index: room.playlistIndex, startSeconds: room.currentTime };
+        if (room.isPlaying) player.current.loadPlaylist(options);
+        else player.current.cuePlaylist(options);
+        setDuration(0);
+      } else if (room.isPlaying) {
+        if (Math.abs(player.current.getCurrentTime() - room.currentTime) > 2) player.current.seekTo(room.currentTime, true);
+        if (player.current.getPlayerState() !== 1) player.current.playVideo();
+      } else {
+        if (player.current.getPlayerState() !== 2) player.current.pauseVideo();
+        if (Math.abs(player.current.getCurrentTime() - room.currentTime) > 2) player.current.seekTo(room.currentTime, true);
+      }
+      lastApplied.current = signature;
+      return;
+    }
     const currentVideo = lastApplied.current.split(":")[0];
     if (currentVideo !== room.videoId) {
       if (room.isPlaying) player.current.loadVideoById(room.videoId, room.currentTime);
@@ -272,10 +325,10 @@ function App() {
       if (Math.abs(player.current.getCurrentTime() - room.currentTime) > 2) player.current.seekTo(room.currentTime, true);
     }
     lastApplied.current = signature;
-  }, [room?.videoId, room?.isPlaying, room?.currentTime]);
+  }, [room?.videoId, room?.playlistId, room?.playlistIndex, room?.isPlaying, room?.currentTime]);
 
   useEffect(() => {
-    if (!room?.isPlaying || !room.videoId || !player.current) {
+    if (!room?.isPlaying || (!room.videoId && !room.playlistId) || !player.current) {
       setNeedsPlaybackTap(false);
       return;
     }
@@ -285,11 +338,15 @@ function App() {
       }
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [room?.videoId, room?.isPlaying, room?.updatedAt]);
+  }, [room?.videoId, room?.playlistId, room?.isPlaying, room?.updatedAt]);
 
   useEffect(() => {
     if (room?.videoId) setError("");
   }, [room?.videoId]);
+
+  useEffect(() => {
+    setPlaylistSize(0);
+  }, [room?.playlistId]);
 
   const connectToRoom = (event: FormEvent, create: boolean) => {
     event.preventDefault();
@@ -306,7 +363,7 @@ function App() {
     else socket.once("connect", send);
   };
 
-  const playbackAction = (action: Action, payload: { time?: number; videoId?: string } = {}) => {
+  const playbackAction = (action: Action, payload: ActionPayload = {}) => {
     if (canControl) socket.emit("playback_action", { action, payload });
     else socket.emit("request_control", { action, payload });
   };
@@ -325,11 +382,25 @@ function App() {
 
   const changeVideo = (event: FormEvent) => {
     event.preventDefault();
+    const playlistId = extractPlaylistId(videoInput);
+    if (playlistId) {
+      playbackAction("change_playlist", { playlistId });
+      setVideoInput("");
+      setError("");
+      return;
+    }
     const videoId = extractVideoId(videoInput);
-    if (!videoId) return setError("Paste a valid YouTube link or 11-character video ID.");
+    if (!videoId) return setError("Paste a YouTube video/live link or playlist URL.");
     playbackAction("change_video", { videoId });
     setVideoInput("");
     setError("");
+  };
+
+  const navigatePlaylist = (offset: -1 | 1) => {
+    if (!room?.playlistId) return;
+    const playlistIndex = room.playlistIndex + offset;
+    if (playlistIndex < 0 || playlistIndex >= playlistSize || playlistIndex >= MAX_PLAYLIST_ITEMS) return;
+    playbackAction("navigate_playlist", { playlistIndex });
   };
 
   const sendChat = (event: FormEvent) => {
@@ -450,22 +521,27 @@ function App() {
           <div className="room-heading"><div><div className="eyebrow">A LITTLE ROOM FOR EVERYONE</div><h1>Watch <span>together.</span></h1></div><div className="watching-pill"><span /> {room.participants.length} watching</div></div>
           <div className="player-frame">
             <div className="video-stage">
-              <div className={`youtube-host ${room.videoId ? "active" : ""}`} ref={playerHost} />
-              {!room.videoId && <div className="empty-player"><div className="play-disc">▶</div><p>The good stuff goes here.</p><span>Drop a YouTube link below to get started.</span></div>}
+              <div className={`youtube-host ${room.videoId || room.playlistId ? "active" : ""}`} ref={playerHost} />
+              {!room.videoId && !room.playlistId && <div className="empty-player"><div className="play-disc">▶</div><p>The good stuff goes here.</p><span>Drop a YouTube link below to get started.</span></div>}
               {needsPlaybackTap && room.isPlaying && <button className="sync-overlay" onClick={startPlaybackFromGesture}><span>▶</span><b>Tap to sync</b><small>Your browser needs a click to start the shared video.</small></button>}
-              {room.videoId && <div className="video-tag"><span>▶</span> WATCHING TOGETHER</div>}
+              {(room.videoId || room.playlistId) && <div className="video-tag"><span>▶</span> {room.playlistId ? `PLAYLIST · ITEM ${room.playlistIndex + 1}${playlistSize ? ` OF ${playlistSize}` : ""}` : "WATCHING TOGETHER"}</div>}
               <div className="floating-reactions" aria-live="polite">
                 {liveReactions.map((reaction) => <span className="floating-reaction" key={reaction.id} title={`${reaction.username} reacted`}>{reaction.emoji}</span>)}
               </div>
             </div>
             <div className="player-controls">
               <div className="control-row">
-                <button className={`play-control ${canControl ? "" : "disabled"}`} disabled={!room.videoId} onClick={controlPlayback} aria-label={room.isPlaying ? "Pause or request pause" : "Play or request play"} title={canControl ? undefined : "Request approval for playback"}>{room.isPlaying ? "Ⅱ" : "▶"}</button>
+                <button className={`play-control ${canControl ? "" : "disabled"}`} disabled={!room.videoId && !room.playlistId} onClick={controlPlayback} aria-label={room.isPlaying ? "Pause or request pause" : "Play or request play"} title={canControl ? undefined : "Request approval for playback"}>{room.isPlaying ? "Ⅱ" : "▶"}</button>
                 <span className="time-readout">{formatTime(liveTime || room.currentTime)} <span>/ {formatTime(duration)}</span></span>
+                {room.playlistId && <div className="playlist-navigation">
+                  <button type="button" disabled={room.playlistIndex <= 0 || !connected} onClick={() => navigatePlaylist(-1)} aria-label="Previous playlist video" title="Previous video">‹</button>
+                  <span>{room.playlistIndex + 1}{playlistSize ? ` / ${playlistSize}` : ""}</span>
+                  <button type="button" disabled={!playlistSize || room.playlistIndex + 1 >= playlistSize || !connected} onClick={() => navigatePlaylist(1)} aria-label="Next playlist video" title="Next video">›</button>
+                </div>}
                 <div className="control-spacer" />
                 <span className="control-hint">{canControl ? "HOST CONTROLS" : "REQUEST CONTROL TO MAKE CHANGES"}</span>
               </div>
-              <input className="seek-bar" type="range" min="0" max={Math.max(duration, 1)} step="1" value={Math.min(liveTime || room.currentTime, Math.max(duration, 1))} disabled={!room.videoId} onChange={(event) => { const time = Number(event.target.value); setLiveTime(time); if (canControl) player.current?.seekTo(time, true); }} onMouseUp={(event) => playbackAction("seek", { time: Number((event.target as HTMLInputElement).value) })} onTouchEnd={(event) => playbackAction("seek", { time: Number((event.target as HTMLInputElement).value) })} />
+              <input className="seek-bar" type="range" min="0" max={Math.max(duration, 1)} step="1" value={Math.min(liveTime || room.currentTime, Math.max(duration, 1))} disabled={!room.videoId && !room.playlistId} onChange={(event) => { const time = Number(event.target.value); setLiveTime(time); if (canControl) player.current?.seekTo(time, true); }} onMouseUp={(event) => playbackAction("seek", { time: Number((event.target as HTMLInputElement).value) })} onTouchEnd={(event) => playbackAction("seek", { time: Number((event.target as HTMLInputElement).value) })} />
             </div>
           </div>
           <div className="live-reaction-bar">
@@ -473,9 +549,10 @@ function App() {
             {LIVE_REACTIONS.map((emoji) => <button type="button" key={emoji} disabled={!connected} onClick={() => sendLiveReaction(emoji)} aria-label={`Send ${emoji} reaction`} title={`Send ${emoji}`}>{emoji}</button>)}
           </div>
           <form className="video-form" onSubmit={changeVideo}>
-            <span className="link-icon">↗</span><input aria-label="YouTube video URL" placeholder={canControl ? "Paste a YouTube link or video ID..." : "Paste a YouTube link to request a video..."} value={videoInput} onChange={(event) => setVideoInput(event.target.value)} />
-            <button type="submit" disabled={!videoInput.trim()}>{canControl ? "Change video" : "Request video"} <span>→</span></button>
+            <span className="link-icon">↗</span><input aria-label="YouTube video or playlist URL" placeholder={canControl ? "Paste a video, live stream, or playlist URL..." : "Paste a video or playlist URL to request it..."} value={videoInput} onChange={(event) => setVideoInput(event.target.value)} />
+            <button type="submit" disabled={!videoInput.trim() || !connected}>{canControl ? "Load" : "Request"} <span>→</span></button>
           </form>
+          <p className="media-hint">Paste a YouTube playlist URL to load its videos, or a public live-stream link. Embedding must be allowed.</p>
           {error && <div className="room-error">{error}<button onClick={() => setError("")}>×</button></div>}
           <div className="note-strip"><span>✦</span> {canControl ? "You're in charge of the remote. Make it a good one." : "You're watching as a guest. Ask the host to give you the remote."}</div>
         </section>
@@ -502,7 +579,7 @@ function App() {
 
           {canControl && <section className="side-card request-card">
             <div className="card-heading"><div><div className="eyebrow">THEY HAVE A THOUGHT</div><h2>Requests <span className="request-count">{requests.length}</span></h2></div></div>
-            {requests.length === 0 ? <p className="empty-requests">Any requests from the crew will show up here.</p> : <div className="request-list">{requests.map((request) => <div className="request-item" key={request.id}><div><b>{request.username}</b><span>{request.action === "change_video" ? "wants to change the video" : request.action === "seek" ? `wants to skip to ${formatTime(request.payload.time ?? 0)}` : `wants to ${request.action}`}</span></div><div className="request-actions"><button className="approve" onClick={() => socket.emit("resolve_request", { requestId: request.id, approved: true })}>✓</button><button className="reject" onClick={() => socket.emit("resolve_request", { requestId: request.id, approved: false })}>×</button></div></div>)}</div>}
+            {requests.length === 0 ? <p className="empty-requests">Any requests from the crew will show up here.</p> : <div className="request-list">{requests.map((request) => <div className="request-item" key={request.id}><div><b>{request.username}</b><span>{request.action === "change_video" ? "wants to change the video" : request.action === "change_playlist" ? "wants to load a playlist" : request.action === "navigate_playlist" ? `wants to play playlist item ${(request.payload.playlistIndex ?? 0) + 1}` : request.action === "seek" ? `wants to skip to ${formatTime(request.payload.time ?? 0)}` : `wants to ${request.action}`}</span></div><div className="request-actions"><button className="approve" onClick={() => socket.emit("resolve_request", { requestId: request.id, approved: true })}>✓</button><button className="reject" onClick={() => socket.emit("resolve_request", { requestId: request.id, approved: false })}>×</button></div></div>)}</div>}
           </section>}
 
           <section className="side-card chat-card">

@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
 
 export type Role = "host" | "moderator" | "participant";
-export type PlaybackAction = "play" | "pause" | "seek" | "change_video";
-export type ActionPayload = { time?: number; videoId?: string };
+export type PlaybackAction = "play" | "pause" | "seek" | "change_video" | "change_playlist" | "navigate_playlist";
+export type ActionPayload = { time?: number; videoId?: string; playlistId?: string; playlistIndex?: number };
 
 export interface Participant {
   userId: string;
@@ -25,6 +25,8 @@ export interface ControlRequest {
 export interface RoomSnapshot {
   id: string;
   videoId: string;
+  playlistId: string;
+  playlistIndex: number;
   isPlaying: boolean;
   currentTime: number;
   updatedAt: number;
@@ -36,6 +38,8 @@ export class Room {
   readonly participants = new Map<string, Participant>();
   readonly requests = new Map<string, ControlRequest>();
   videoId = "";
+  playlistId = "";
+  playlistIndex = 0;
   isPlaying = false;
   currentTime = 0;
   updatedAt = Date.now();
@@ -46,6 +50,8 @@ export class Room {
     return {
       id: this.id,
       videoId: this.videoId,
+      playlistId: this.playlistId,
+      playlistIndex: this.playlistIndex,
       isPlaying: this.isPlaying,
       currentTime: this.currentTime,
       updatedAt: this.updatedAt,

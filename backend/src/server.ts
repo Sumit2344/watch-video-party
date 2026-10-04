@@ -61,6 +61,14 @@ function validVideoId(value: unknown): value is string {
   return typeof value === "string" && /^[\w-]{11}$/.test(value);
 }
 
+function validPlaylistId(value: unknown): value is string {
+  return typeof value === "string" && /^[\w-]{10,128}$/.test(value);
+}
+
+function validPlaylistIndex(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 500;
+}
+
 function emitError(socket: Socket, message: string): void {
   socket.emit("room_error", message);
 }
@@ -75,7 +83,7 @@ function publishRoom(room: Room): void {
 }
 
 function applyAction(room: Room, action: PlaybackAction, payload: ActionPayload): boolean {
-  if ((action === "play" || action === "pause") && !room.videoId) return false;
+  if ((action === "play" || action === "pause") && !room.videoId && !room.playlistId) return false;
   if (action === "play" || action === "pause") {
     room.isPlaying = action === "play";
     if (typeof payload.time === "number" && Number.isFinite(payload.time) && payload.time >= 0) {
@@ -89,8 +97,24 @@ function applyAction(room: Room, action: PlaybackAction, payload: ActionPayload)
   if (action === "change_video") {
     if (!validVideoId(payload.videoId)) return false;
     room.videoId = payload.videoId;
+    room.playlistId = "";
+    room.playlistIndex = 0;
     room.currentTime = 0;
     room.isPlaying = false;
+  }
+  if (action === "change_playlist") {
+    if (!validPlaylistId(payload.playlistId)) return false;
+    room.videoId = "";
+    room.playlistId = payload.playlistId;
+    room.playlistIndex = 0;
+    room.currentTime = 0;
+    room.isPlaying = false;
+  }
+  if (action === "navigate_playlist") {
+    if (!room.playlistId || !validPlaylistIndex(payload.playlistIndex)) return false;
+    room.playlistIndex = payload.playlistIndex;
+    room.currentTime = 0;
+    room.isPlaying = true;
   }
   room.updatedAt = Date.now();
   return true;
@@ -139,7 +163,7 @@ io.on("connection", (socket) => {
     const actor = room && [...room.participants.values()].find((entry) => entry.socketId === socket.id);
     if (!room || !actor || !isController(actor.role)) return emitError(socket, "Only the host or a moderator can control playback.");
     const action = input?.action;
-    if (action !== "play" && action !== "pause" && action !== "seek" && action !== "change_video") {
+    if (action !== "play" && action !== "pause" && action !== "seek" && action !== "change_video" && action !== "change_playlist" && action !== "navigate_playlist") {
       return emitError(socket, "That playback action is not supported.");
     }
     if (!applyAction(room, action, input.payload ?? {})) return emitError(socket, "The playback action has invalid data.");
@@ -151,7 +175,7 @@ io.on("connection", (socket) => {
     const actor = room && [...room.participants.values()].find((entry) => entry.socketId === socket.id);
     const action = input?.action;
     if (!room || !actor || actor.role !== "participant") return emitError(socket, "Only participants need to request approval.");
-    if (action !== "play" && action !== "pause" && action !== "seek" && action !== "change_video") {
+    if (action !== "play" && action !== "pause" && action !== "seek" && action !== "change_video" && action !== "change_playlist" && action !== "navigate_playlist") {
       return emitError(socket, "That playback request is not supported.");
     }
     const payload = input.payload ?? {};
@@ -159,7 +183,11 @@ io.on("connection", (socket) => {
       return emitError(socket, "Enter a valid seek position.");
     }
     if (action === "change_video" && !validVideoId(payload.videoId)) return emitError(socket, "Enter a valid YouTube video.");
-    if ((action === "play" || action === "pause") && !room.videoId) return emitError(socket, "Choose a video before requesting playback.");
+    if (action === "change_playlist" && !validPlaylistId(payload.playlistId)) return emitError(socket, "Enter a valid YouTube playlist.");
+    if (action === "navigate_playlist" && (!room.playlistId || !validPlaylistIndex(payload.playlistIndex))) {
+      return emitError(socket, "Choose a valid item from the active playlist.");
+    }
+    if ((action === "play" || action === "pause") && !room.videoId && !room.playlistId) return emitError(socket, "Choose a video before requesting playback.");
     const request: ControlRequest = {
       id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       userId: actor.userId,
