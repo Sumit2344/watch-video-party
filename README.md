@@ -30,17 +30,17 @@ For deployment, use the root `render.yaml` Blueprint to create a Render web serv
 
 ## How it works
 
-The browser connects to the Socket.IO server and creates or joins a room using an 8-character code. The backend owns each room's participants, roles, playback state, and pending requests, and broadcasts room updates to its members. A private per-browser session token allows a participant to reconnect without exposing that token in room data. A host or moderator can control playback; participant controls are rejected by the backend and are sent as approval requests instead. The YouTube IFrame Player API applies the server's video, play/pause, and seek state in each browser. If browser autoplay restrictions block playback for a joiner, the player offers a click-to-sync action. Videos whose owners disable embedding cannot play in the room. The host can promote moderators, remove participants, and transfer ownership. Room chat is broadcast over the same Socket.IO connection.
+The browser connects to the Socket.IO server and creates or joins a room using an 8-character code. The backend owns each room's participants, roles, playback state, and pending requests, and broadcasts room updates to its members. A private per-browser session token allows a participant to reconnect without exposing that token in room data. A host or moderator can control playback; participant controls are rejected by the backend and are sent as approval requests instead. The YouTube IFrame Player API applies the server's video, play/pause, and seek state in each browser. If browser autoplay restrictions block playback for a joiner, the player offers a click-to-sync action. Videos whose owners disable embedding cannot play in the room. The host can promote moderators, remove participants, and transfer ownership. Room chat, animated GIF uploads (up to 512 KB), and heart/like/laugh/fire reactions are broadcast live over the same Socket.IO connection. Messages and reactions are temporary and are not stored after leaving the room or restarting the server.
 
 Rooms are ephemeral and live in one server process. Add persistent storage and a Socket.IO adapter such as Redis before using multiple backend instances or requiring rooms to survive restarts.
 
 ## Deployment
 
-No public deployment URL is configured yet. This folder is not connected to a Git repository, so Render cannot deploy it directly yet. Put this folder in a GitHub repository, then in the Render Dashboard choose **New → Blueprint**, connect that repository, and apply the `render.yaml` Blueprint. Render will create both services; add the resulting static-site URL to the table below once deployment succeeds.
+The Render Blueprint builds the frontend with `VITE_API_URL` pointing at the backend service. Deploy both services from the repository's `render.yaml`; the frontend and backend must use the same Socket.IO server.
 
 | Service | URL |
 | --- | --- |
-| Frontend | Not deployed |
-| Backend | Not deployed |
+| Frontend | https://together-watch-party-31rm.onrender.com |
+| Backend health | https://together-watch-party-api.onrender.com/health |
 
-The Blueprint allows cross-origin requests to the public API so the generated frontend URL can connect without extra configuration. Anyone with a room link can join; rooms are in-memory and are lost when the free web service sleeps or restarts. Use persistent storage and a paid always-on service for a production deployment.
+The Blueprint allows cross-origin requests to the public API so the frontend can connect without extra configuration. Anyone with a room link can join; rooms are in-memory and are lost when the free web service sleeps or restarts. GIFs are sent directly to current room members and are not uploaded to persistent storage. Use persistent storage and a paid always-on service for a production deployment.

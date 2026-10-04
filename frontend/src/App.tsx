@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
 
 type Role = "host" | "moderator" | "participant";
@@ -6,8 +6,11 @@ type Action = "play" | "pause" | "seek" | "change_video";
 type Participant = { userId: string; username: string; role: Role; joinedAt: number };
 type Request = { id: string; userId: string; username: string; action: Action; payload: { time?: number; videoId?: string } };
 type RoomState = { id: string; videoId: string; isPlaying: boolean; currentTime: number; updatedAt: number; participants: Participant[] };
-type ChatMessage = { id: string; userId: string; username: string; message: string; createdAt: number };
+type ChatMessage = { id: string; userId: string; username: string; kind: "text" | "gif"; message?: string; gifData?: string; createdAt: number };
+type LiveReaction = { id: string; userId: string; username: string; emoji: string; createdAt: number };
 type JoinedPayload = { state: RoomState; requests: Request[] };
+const LIVE_REACTIONS = ["❤️", "👍", "😂", "🔥"] as const;
+const MAX_GIF_SIZE = 512 * 1024;
 
 declare global {
   interface Window {
@@ -89,6 +92,7 @@ function App() {
   const [room, setRoom] = useState<RoomState | null>(null);
   const [requests, setRequests] = useState<Request[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [liveReactions, setLiveReactions] = useState<LiveReaction[]>([]);
   const [chatText, setChatText] = useState("");
   const [videoInput, setVideoInput] = useState("");
   const [error, setError] = useState("");
@@ -98,6 +102,7 @@ function App() {
   const [liveTime, setLiveTime] = useState(0);
   const [needsPlaybackTap, setNeedsPlaybackTap] = useState(false);
   const playerHost = useRef<HTMLDivElement>(null);
+  const gifInput = useRef<HTMLInputElement>(null);
   const player = useRef<YouTubePlayer | null>(null);
   const lastApplied = useRef("");
   const roomRef = useRef<RoomState | null>(null);
@@ -116,6 +121,7 @@ function App() {
       setRequests(nextRequests);
       setError("");
       setMessages([]);
+      setLiveReactions([]);
       history.replaceState(null, "", `?room=${state.id}`);
       setRoomCode(state.id);
     };
@@ -131,6 +137,9 @@ function App() {
       setError("You were removed from this room by the host.");
     };
     const onChat = (message: ChatMessage) => setMessages((current) => [...current.slice(-99), message]);
+    const onLiveReaction = (reaction: LiveReaction) => {
+      setLiveReactions((current) => [...current.filter((item) => Date.now() - item.createdAt < 2600).slice(-11), reaction]);
+    };
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("room_joined", onJoined);
@@ -138,6 +147,7 @@ function App() {
     socket.on("room_error", onError);
     socket.on("participant_removed", onRemoved);
     socket.on("chat_message", onChat);
+    socket.on("live_reaction", onLiveReaction);
     return () => {
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
@@ -146,9 +156,18 @@ function App() {
       socket.off("room_error", onError);
       socket.off("participant_removed", onRemoved);
       socket.off("chat_message", onChat);
+      socket.off("live_reaction", onLiveReaction);
       socket.disconnect();
     };
   }, [socket]);
+
+  useEffect(() => {
+    if (liveReactions.length === 0) return;
+    const timer = window.setTimeout(() => {
+      setLiveReactions((current) => current.filter((reaction) => Date.now() - reaction.createdAt < 2600));
+    }, 2700);
+    return () => window.clearTimeout(timer);
+  }, [liveReactions]);
 
   useEffect(() => {
     if (!room?.videoId) return;
@@ -320,6 +339,43 @@ function App() {
     setChatText("");
   };
 
+  const sendGif = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (file.type !== "image/gif" && !file.name.toLowerCase().endsWith(".gif")) {
+      setError("Choose a GIF file to share.");
+      return;
+    }
+    if (file.size > MAX_GIF_SIZE) {
+      setError("GIFs must be 512 KB or smaller.");
+      return;
+    }
+    if (!socket.connected) {
+      setError("Reconnecting — try sharing the GIF again when connected.");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => setError("The GIF could not be read. Please try again.");
+    reader.onload = () => {
+      if (typeof reader.result !== "string" || !reader.result.startsWith("data:image/gif;base64,")) {
+        setError("That file could not be read as a GIF.");
+        return;
+      }
+      socket.emit("chat_message", { gifData: reader.result });
+      setError("");
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const sendLiveReaction = (emoji: typeof LIVE_REACTIONS[number]) => {
+    if (!connected) {
+      setError("Reactions are available when the room is connected.");
+      return;
+    }
+    socket.emit("live_reaction", { emoji });
+  };
+
   const copyInvite = async () => {
     if (!room) return;
     try {
@@ -398,6 +454,9 @@ function App() {
               {!room.videoId && <div className="empty-player"><div className="play-disc">▶</div><p>The good stuff goes here.</p><span>Drop a YouTube link below to get started.</span></div>}
               {needsPlaybackTap && room.isPlaying && <button className="sync-overlay" onClick={startPlaybackFromGesture}><span>▶</span><b>Tap to sync</b><small>Your browser needs a click to start the shared video.</small></button>}
               {room.videoId && <div className="video-tag"><span>▶</span> WATCHING TOGETHER</div>}
+              <div className="floating-reactions" aria-live="polite">
+                {liveReactions.map((reaction) => <span className="floating-reaction" key={reaction.id} title={`${reaction.username} reacted`}>{reaction.emoji}</span>)}
+              </div>
             </div>
             <div className="player-controls">
               <div className="control-row">
@@ -408,6 +467,10 @@ function App() {
               </div>
               <input className="seek-bar" type="range" min="0" max={Math.max(duration, 1)} step="1" value={Math.min(liveTime || room.currentTime, Math.max(duration, 1))} disabled={!room.videoId} onChange={(event) => { const time = Number(event.target.value); setLiveTime(time); if (canControl) player.current?.seekTo(time, true); }} onMouseUp={(event) => playbackAction("seek", { time: Number((event.target as HTMLInputElement).value) })} onTouchEnd={(event) => playbackAction("seek", { time: Number((event.target as HTMLInputElement).value) })} />
             </div>
+          </div>
+          <div className="live-reaction-bar">
+            <span><i /> LIVE REACTIONS</span>
+            {LIVE_REACTIONS.map((emoji) => <button type="button" key={emoji} disabled={!connected} onClick={() => sendLiveReaction(emoji)} aria-label={`Send ${emoji} reaction`} title={`Send ${emoji}`}>{emoji}</button>)}
           </div>
           <form className="video-form" onSubmit={changeVideo}>
             <span className="link-icon">↗</span><input aria-label="YouTube video URL" placeholder={canControl ? "Paste a YouTube link or video ID..." : "Paste a YouTube link to request a video..."} value={videoInput} onChange={(event) => setVideoInput(event.target.value)} />
@@ -445,9 +508,14 @@ function App() {
           <section className="side-card chat-card">
             <div className="card-heading"><div><div className="eyebrow">BETTER WITH BANTER</div><h2>The side chat <span className="chat-spark">✳</span></h2></div></div>
             <div className="chat-messages">
-              {messages.length === 0 ? <div className="chat-empty"><span>☁</span><p>It's quiet in here.<br />Say something nice.</p></div> : messages.map((message) => <div className={`chat-message ${message.userId === meId ? "mine" : ""}`} key={message.id}><div className="chat-meta"><b>{message.userId === meId ? "You" : message.username}</b><span>{new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span></div><p>{message.message}</p></div>)}
+              {messages.length === 0 ? <div className="chat-empty"><span>☁</span><p>It's quiet in here.<br />Say something nice.</p></div> : messages.map((message) => <div className={`chat-message ${message.userId === meId ? "mine" : ""}`} key={message.id}><div className="chat-meta"><b>{message.userId === meId ? "You" : message.username}</b><span>{new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span></div>{message.kind === "gif" && message.gifData ? <img className="gif-message" src={message.gifData} alt={`${message.username}'s GIF`} /> : <p>{message.message}</p>}</div>)}
             </div>
-            <form className="chat-form" onSubmit={sendChat}><input placeholder="Send a little message..." maxLength={500} value={chatText} onChange={(event) => setChatText(event.target.value)} /><button disabled={!chatText.trim()} aria-label="Send message">↑</button></form>
+            <form className="chat-form" onSubmit={sendChat}>
+              <input placeholder="Send a little message..." maxLength={500} value={chatText} onChange={(event) => setChatText(event.target.value)} />
+              <input ref={gifInput} className="gif-file-input" type="file" accept="image/gif,.gif" onChange={sendGif} aria-label="Choose a GIF to share" />
+              <button className="gif-button" type="button" disabled={!connected} onClick={() => gifInput.current?.click()} aria-label="Share a GIF" title="Share a GIF (512 KB max)">GIF</button>
+              <button type="submit" disabled={!chatText.trim() || !connected} aria-label="Send message">↑</button>
+            </form>
           </section>
           <div className="privacy-note">✳ <span>ROOMS ARE PRIVATE BY LINK.<br />ONLY INVITE YOUR PEOPLE.</span></div>
         </aside>

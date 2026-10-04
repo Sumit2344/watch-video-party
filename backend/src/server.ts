@@ -22,6 +22,16 @@ const io = new Server(httpServer, {
 });
 const rooms = new RoomManager();
 const socketRooms = new Map<string, string>();
+const lastReactionAt = new Map<string, number>();
+
+function validGifData(value: unknown): value is string {
+  const prefix = "data:image/gif;base64,";
+  if (typeof value !== "string" || !value.startsWith(prefix)) return false;
+  const base64 = value.slice(prefix.length);
+  if (!base64 || base64.length > 700_000 || base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) return false;
+  const bytes = Buffer.from(base64, "base64");
+  return bytes.length <= 512 * 1024 && (bytes.toString("ascii", 0, 6) === "GIF87a" || bytes.toString("ascii", 0, 6) === "GIF89a");
+}
 
 app.use(cors({ origin: allowedOrigins }));
 app.get("/health", (_request, response) => response.json({ status: "ok" }));
@@ -213,18 +223,53 @@ io.on("connection", (socket) => {
     publishRoom(room);
   });
 
-  socket.on("chat_message", (input: { message?: unknown }) => {
+  socket.on("chat_message", (input: { message?: unknown; gifData?: unknown }) => {
     const room = rooms.get(socketRooms.get(socket.id) ?? "");
     const actor = room && [...room.participants.values()].find((entry) => entry.socketId === socket.id);
-    if (!room || !actor || typeof input?.message !== "string") return;
+    if (!room || !actor) return;
+    const createdAt = Date.now();
+    const id = `${createdAt}-${Math.random().toString(36).slice(2, 7)}`;
+    if (validGifData(input?.gifData)) {
+      io.to(room.id).emit("chat_message", {
+        id,
+        userId: actor.userId,
+        username: actor.username,
+        kind: "gif",
+        gifData: input.gifData,
+        createdAt,
+      });
+      return;
+    }
+    if (input?.gifData !== undefined) return emitError(socket, "GIF must be a valid GIF under 512 KB.");
+    if (typeof input?.message !== "string") return;
     const message = input.message.trim().slice(0, 500);
     if (!message) return;
     io.to(room.id).emit("chat_message", {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      id,
       userId: actor.userId,
       username: actor.username,
+      kind: "text",
       message,
-      createdAt: Date.now(),
+      createdAt,
+    });
+  });
+
+  socket.on("live_reaction", (input: { emoji?: unknown }) => {
+    const room = rooms.get(socketRooms.get(socket.id) ?? "");
+    const actor = room && [...room.participants.values()].find((entry) => entry.socketId === socket.id);
+    const allowedReactions = ["❤️", "👍", "😂", "🔥"];
+    if (!room || !actor || typeof input?.emoji !== "string" || !allowedReactions.includes(input.emoji)) {
+      return emitError(socket, "Choose one of the available live reactions.");
+    }
+    const now = Date.now();
+    if (now - (lastReactionAt.get(socket.id) ?? 0) < 350) return;
+    lastReactionAt.set(socket.id, now);
+    io.to(room.id).emit("live_reaction", {
+      id: `${now}-${Math.random().toString(36).slice(2, 7)}`,
+      userId: actor.userId,
+      username: actor.username,
+      emoji: input.emoji,
+      createdAt: now,
     });
   });
 
@@ -238,6 +283,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", async () => {
+    lastReactionAt.delete(socket.id);
     const roomId = socketRooms.get(socket.id);
     const room = roomId ? rooms.get(roomId) : undefined;
     const participant = room && [...room.participants.values()].find((entry) => entry.socketId === socket.id);
