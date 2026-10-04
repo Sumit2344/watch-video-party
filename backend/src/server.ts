@@ -14,13 +14,16 @@ import {
 const app = express();
 const httpServer = createServer(app);
 const clientOrigin = process.env.CLIENT_ORIGIN ?? "http://localhost:5173";
+const allowedOrigins = clientOrigin.trim() === "*"
+  ? "*"
+  : clientOrigin.split(",").map((origin) => origin.trim());
 const io = new Server(httpServer, {
-  cors: { origin: clientOrigin.split(",").map((origin) => origin.trim()), methods: ["GET", "POST"] },
+  cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
 });
 const rooms = new RoomManager();
 const socketRooms = new Map<string, string>();
 
-app.use(cors({ origin: clientOrigin.split(",").map((origin) => origin.trim()) }));
+app.use(cors({ origin: allowedOrigins }));
 app.get("/health", (_request, response) => response.json({ status: "ok" }));
 
 type IdentityInput = { userId?: unknown; username?: unknown; sessionToken?: unknown; roomId?: unknown };
